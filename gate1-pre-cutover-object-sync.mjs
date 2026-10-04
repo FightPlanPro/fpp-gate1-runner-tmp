@@ -1,8 +1,74 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { Storage } from "@google-cloud/storage";
-import { S3Client, ListObjectsV2Command, HeadObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+
+const EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e";
+
+function isProvenEmptyMarker(key, meta) {
+  return !!meta && typeof key === "string" && key.endsWith("/") && Number(meta.size) === 0 && meta.md5 === EMPTY_MD5;
+}
+
+function stageError(stage) {
+  const err = new Error(stage);
+  err.stage = stage;
+  return err;
+}
+
+function markerBody(downloadFailed, downloaded) {
+  if (downloadFailed) return Buffer.alloc(0);
+  return downloaded;
+}
+
+function assertEmptyMarkerBody(body, expected) {
+  const md5 = createHash("md5").update(body).digest("hex");
+  if (Number(expected.size) !== 0 || expected.md5 !== EMPTY_MD5 || body.length !== 0 || md5 !== EMPTY_MD5) {
+    throw stageError("NON_EMPTY_SLASH");
+  }
+  return md5;
+}
+
+function copyRoute(key, meta) {
+  if (!meta || !meta.md5) return "NO_MD5";
+  if (key.endsWith("/") && !isProvenEmptyMarker(key, meta)) return "NON_EMPTY_SLASH";
+  if (isProvenEmptyMarker(key, meta)) return "EMPTY_MARKER";
+  return "NORMAL";
+}
+
+if (process.argv.includes("--self-test")) {
+  let failed = 0;
+  const check = (name, cond) => {
+    if (!cond) {
+      console.log("SELF_TEST_FAIL=" + name);
+      failed++;
+    }
+  };
+  const empty = { size: 0, md5: EMPTY_MD5 };
+  check("public-marker", isProvenEmptyMarker("public/", empty));
+  check("nested-marker", isProvenEmptyMarker("public/a/", empty));
+  check("file-not-marker", !isProvenEmptyMarker("public/file.txt", empty));
+  check("nonzero-size", !isProvenEmptyMarker("public/", { size: 1, md5: EMPTY_MD5 }));
+  check("wrong-md5", !isProvenEmptyMarker("public/", { size: 0, md5: "ab".repeat(16) }));
+  check("missing-md5", !isProvenEmptyMarker("public/", { size: 0, md5: "" }));
+  const fallback = markerBody(true, null);
+  check("fallback-empty", fallback.length === 0 && createHash("md5").update(fallback).digest("hex") === EMPTY_MD5);
+  let rejectedBody = false;
+  try { assertEmptyMarkerBody(Buffer.from("x"), empty); } catch (err) { rejectedBody = err.stage === "NON_EMPTY_SLASH"; }
+  check("nonempty-body-fails", rejectedBody);
+  let rejectedMeta = false;
+  try { assertEmptyMarkerBody(Buffer.alloc(0), { size: 4, md5: EMPTY_MD5 }); } catch (err) { rejectedMeta = err.stage === "NON_EMPTY_SLASH"; }
+  check("nonzero-meta-fails", rejectedMeta);
+  check("empty-body-ok", assertEmptyMarkerBody(Buffer.alloc(0), empty) === EMPTY_MD5);
+  check("content-md5", Buffer.from(EMPTY_MD5, "hex").toString("base64") === "1B2M2Y8AsgTpgAmY7PhCfg==");
+  check("route-public", copyRoute("public/", empty) === "EMPTY_MARKER");
+  check("route-nonempty-slash", copyRoute("public/file/", { size: 5, md5: EMPTY_MD5 }) === "NON_EMPTY_SLASH");
+  check("route-zero-wrong-md5", copyRoute("public/", { size: 0, md5: "ab".repeat(16) }) === "NON_EMPTY_SLASH");
+  check("route-normal", copyRoute("meal.jpg", { size: 5, md5: "ab".repeat(16) }) === "NORMAL");
+  check("route-no-md5", copyRoute("x", { size: 0, md5: "" }) === "NO_MD5");
+  check("stages", ["DOWNLOAD", "PUT", "VERIFY", "NO_MD5", "SOURCE_MISMATCH"].every((stage) => stageError(stage).stage === stage));
+  if (failed) process.exit(1);
+  console.log("SELF_TEST_PASS=YES");
+  process.exit(0);
+}
 
 const dir = "/tmp/fpp-gate1";
 const secretPaths = ["payload.json", "password.raw", "password.bin", "wrap.bin", "cipher.bin"].map((name) => `${dir}/${name}`);
@@ -80,6 +146,9 @@ const sourceBucket = String(process.env.DEFAULT_OBJECT_STORAGE_BUCKET_ID || "");
 if (!sourceBucket) fail("SOURCE_BUCKET_MISSING");
 const destBucket = "fight-plan-r2-production";
 
+const { Storage } = await import("@google-cloud/storage");
+const { S3Client, ListObjectsV2Command, HeadObjectCommand, GetObjectCommand, PutObjectCommand } = await import("@aws-sdk/client-s3");
+
 const gcs = new Storage({
   credentials: {
     audience: "replit",
@@ -142,19 +211,52 @@ async function sameObject(key, meta, dest) {
   const body = Buffer.concat(chunks);
   return body.length === meta.size && createHash("md5").update(body).digest("hex") === meta.md5;
 }
-async function copyOne(key, expected) {
-  const [body] = await gcs.bucket(sourceBucket).file(key).download();
+async function putAndVerify(key, body, expected) {
   const md5 = createHash("md5").update(body).digest("hex");
-  if (md5 !== expected.md5 || body.length !== expected.size) throw new Error("source mismatch");
-  await r2.send(new PutObjectCommand({
-    Bucket: destBucket,
-    Key: key,
-    Body: body,
-    ContentLength: body.length,
-    ContentMD5: Buffer.from(md5, "hex").toString("base64"),
-  }));
-  const head = await r2.send(new HeadObjectCommand({ Bucket: destBucket, Key: key }));
-  if (Number(head.ContentLength) !== expected.size || etagMd5(head.ETag) !== expected.md5) throw new Error("verify mismatch");
+  if (md5 !== expected.md5 || body.length !== expected.size) throw stageError("SOURCE_MISMATCH");
+  try {
+    await r2.send(new PutObjectCommand({
+      Bucket: destBucket,
+      Key: key,
+      Body: body,
+      ContentLength: body.length,
+      ContentMD5: Buffer.from(md5, "hex").toString("base64"),
+    }));
+  } catch (err) {
+    err.stage = "PUT";
+    throw err;
+  }
+  let head;
+  try {
+    head = await r2.send(new HeadObjectCommand({ Bucket: destBucket, Key: key }));
+  } catch (err) {
+    err.stage = "VERIFY";
+    throw err;
+  }
+  if (Number(head.ContentLength) !== expected.size || etagMd5(head.ETag) !== expected.md5) throw stageError("VERIFY");
+}
+async function copyOne(key, expected) {
+  let body;
+  try {
+    [body] = await gcs.bucket(sourceBucket).file(key).download();
+  } catch (err) {
+    err.stage = "DOWNLOAD";
+    throw err;
+  }
+  if (key.endsWith("/") && !isProvenEmptyMarker(key, expected)) throw stageError("NON_EMPTY_SLASH");
+  await putAndVerify(key, body, expected);
+}
+async function copyEmptyMarker(key, expected) {
+  if (!isProvenEmptyMarker(key, expected)) throw stageError("NON_EMPTY_SLASH");
+  let body;
+  try {
+    const [downloaded] = await gcs.bucket(sourceBucket).file(key).download();
+    body = markerBody(false, downloaded);
+  } catch {
+    body = markerBody(true, null);
+  }
+  assertEmptyMarkerBody(body, expected);
+  await putAndVerify(key, body, expected);
 }
 
 let firstSource = await sourceList();
@@ -173,19 +275,28 @@ let copied = 0, replaced = 0, bytesCopied = 0, acceptedUnreadable = 0;
 const seenAccepted = new Set();
 for (const key of work) {
   const meta = firstSource.out.get(key);
-  if (!meta.md5) {
+  const route = copyRoute(key, meta);
+  if (route === "NO_MD5") {
     if (accepted.has(createHash("sha256").update(key).digest("hex"))) { acceptedUnreadable++; continue; }
-    fail("COPY_FAILURE_KEY=" + key);
+    fail("COPY_FAILURE_STAGE=NO_MD5 KEY=" + key);
   }
+  if (route === "NON_EMPTY_SLASH") fail("COPY_FAILURE_STAGE=NON_EMPTY_SLASH KEY=" + key);
   const existed = beforeR2.out.has(key);
   let ok = false;
+  let stage = "UNKNOWN";
   for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
-    try { await copyOne(key, meta); ok = true; } catch {}
+    try {
+      if (route === "EMPTY_MARKER") await copyEmptyMarker(key, meta);
+      else await copyOne(key, meta);
+      ok = true;
+    } catch (err) {
+      stage = err.stage || "UNKNOWN";
+    }
   }
   const keyHash = createHash("sha256").update(key).digest("hex");
   if (!ok) {
     if (accepted.has(keyHash)) { acceptedUnreadable++; seenAccepted.add(keyHash); continue; }
-    fail("COPY_FAILURE_KEY=" + key);
+    fail("COPY_FAILURE_STAGE=" + stage + " KEY=" + key);
   }
   if (accepted.has(keyHash)) seenAccepted.add(keyHash);
   copied++;
