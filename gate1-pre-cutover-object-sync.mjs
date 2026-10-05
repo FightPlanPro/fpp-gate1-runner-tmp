@@ -165,6 +165,7 @@ const r2 = new S3Client({
   endpoint,
   forcePathStyle: true,
   credentials: { accessKeyId, secretAccessKey },
+  requestChecksumCalculation: "WHEN_REQUIRED",
 });
 
 async function sourceList() {
